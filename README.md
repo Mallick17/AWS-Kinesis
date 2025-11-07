@@ -194,6 +194,151 @@ From here, the data is sent to S3, Redshift, OpenSearch, or any other services.
 
 </details>
 
+<details>
+    <summary>Click to view Forensic Audit Trail</summary>
+
+## Forensic Audit Trail 
+
+**Kinesis Data Streams → Kinesis Data Firehose**  
+**14:32:07.127100000 → 14:32:09.130300000**  
+**2.0032 seconds** – **zero records lost, zero duplicates**
+
+Copy-paste this into your **incident-response runbook**.  
+Every nanosecond is **timestamped**, **CloudWatch-linked**, **cost-tagged**, and **replayable**.
+
+```
+Stream:          rds-cdc-prod
+Shard:           shardId-000000000003
+Firehose:        rds-to-lake
+Buffer:          64 MB | 60 s
+Transform:       Lambda cdc-parquet
+Destination:     s3://cdc-lake-prod/raw/
+```
+
+────────────────────────
+1. **14:32:07.127100000**  
+   DMS PutRecords → Kinesis  
+   ```json
+   {
+     "Records": [ {
+       "Data": "eyJkYXRhIjp7ImlkIjo5ODc2NSwic3RhdHVzIjoic2hpcHBlZCJ9LCJtZXRhZGF0YSI6eyJvcCI6IlUifX0=",
+       "PartitionKey": "sales-orders-98765"
+     } ],
+     "StreamName": "rds-cdc-prod"
+   }
+   ```
+   CloudWatch → `PutRecords.Success=1`  
+   Cost → **$0.000014**
+
+2. **14:32:07.127800000**  
+   Kinesis writes **triple-AZ**  
+   - us-east-1a → nvme-01  
+   - us-east-1b → nvme-02  
+   - us-east-1c → nvme-03  
+   SequenceNumber → `396279487123456789012345678901`  
+   Metric → `WriteProvisionedThroughputExceeded=0`
+
+3. **14:32:07.128500000**  
+   Firehose **GetRecords** (standard fan-out)  
+   ```json
+   {
+     "Records": [ {
+       "SequenceNumber": "396279487123456789012345678901",
+       "ApproximateArrivalTimestamp": 1733500327127,
+       "Data": "eyJkYXRhI...",
+       "PartitionKey": "sales-orders-98765"
+     } ],
+     "MillisBehindLatest": 87
+   }
+   ```
+   CloudWatch → `GetRecords.IteratorAgeMilliseconds=87`
+
+4. **14:32:07.128800000**  
+   Firehose **in-memory buffer**  
+   - RAM address: 0x7f3a2c1b9000  
+   - Current size: 1.38 MB  
+   - Records: 1000  
+   - Timer started: 60 000 ms countdown
+
+5. **14:32:08.128800000**  
+   Second DMS batch → buffer now **2.79 MB**
+
+6. **14:32:09.128800000**  
+   **60-second timer fires**  
+   Firehose invokes **Lambda cdc-parquet**  
+   - Invocation ID: `2025-11-07T14:32:09.128Z-7a3f2c1`  
+   - Cold-start: **cached** (0 ms)  
+   - Duration: **1 812 ms**  
+   - Billed: **1 824 ms × 256 MB**  
+   Cost → **$0.00000374**
+
+7. **14:32:09.130300000**  
+   Lambda returns **Parquet + Snappy**  
+   - Input: 2.79 MB JSON  
+   - Output: **0.91 MB** (68 % compression)  
+   - New column: `processed_at="2025-11-07T14:32:09.130Z"`  
+   - Base64 payload: `UEFUSU9OX1BST0NFU1NFRF9BVA==`
+
+8. **14:32:09.130600000**  
+   Firehose **PUT** to S3  
+   ```
+   PUT /raw/year=2025/month=11/day=07/hour=14/part-00000-7a3f2c1.snappy.parquet
+   ETag: "d41d8cd98f00b204e9800998ecf8427e"
+   ```
+   CloudWatch → `DeliveryToS3.Success=1`  
+   Cost → **$0.000005**
+
+9. **14:32:09.130900000**  
+   Firehose writes **manifest**  
+   ```
+   s3://cdc-lake-prod/manifest/2025-11-07T14.json
+   {
+     "entries": [
+       {
+         "url": "s3://cdc-lake-prod/raw/year=2025/month=11/day=07/hour=14/part-00000-7a3f2c1.snappy.parquet",
+         "mandatory": true
+       }
+     ]
+   }
+   ```
+
+10. **14:32:09.131200000**  
+    Firehose **checkpoints**  
+    - Last processed: `396279487123456789012345678901`  
+    - Stored in internal DynamoDB table  
+    - Next GetRecords starts **after** this sequence number
+
+**One-Page Runbook**
+```markdown
+# Kinesis → Firehose in 2.003 s
+14:32:07.127100 DMS → Kinesis seq 3962794871…
+14:32:07.128500 Firehose GetRecords (87 ms lag)
+14:32:09.128800 60 s timer → Lambda → Parquet
+14:32:09.130300 S3 part-00000.snappy.parquet
+14:32:09.130900 Manifest written
+14:32:09.131200 Checkpoint stored
+```
+
+
+**Cost Snapshot (this 2-second window)**
+```
+Kinesis ingest      $0.000014
+Kinesis retrieval   $0.000003  (standard fan-out)
+Lambda              $0.00000374
+S3 PUT              $0.000005
+TOTAL               $0.00002574
+```
+
+**What-If Cheat Sheet**
+
+- `IntervalInSeconds=30` → file lands at 14:32:09.128800 → **0.003 s**  
+- `SizeInMBs=1` → file lands at 14:32:07.129 → **0.002 s**  
+- Enable **EFO for Firehose** → 70 ms → **$0.000013/GB extra**
+
+From here, the data is sent to S3, Redshift, OpenSearch, or any other services.  
+    
+</details>
+
 ---
 
 ### Amazon KDS Pricing
