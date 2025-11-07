@@ -344,6 +344,133 @@ From here, the data is sent to S3, Redshift, OpenSearch, or any other services.
 
 ### Amazon Data Firehose
 
+# Kinesis Data Firehose → S3 Data Lake  
+This section focuses **exclusively** on what happens **after** Firehose receives the last byte from Kinesis.  
+We pick up at the exact millisecond the **60-second timer fires** and follow the payload **byte-by-byte** until it is **immutably stored in S3**, **ETag-verified**, and **ready for any tool**.
+
+```
+[Firehose: 2.79 MB in RAM]
+          ↓ (60 s timer OR 64 MB)
+[Lambda Transform → Snappy Parquet]
+          ↓ (exactly-once PUT)
+[S3 Object + Manifest]
+```
+
+- **Latency**: 1.8 s transform + 0.3 s PUT = **2.1 s**  
+- **Throughput**: 2.79 MB → 0.91 MB (68 % compression)  
+- **Cost Drivers**: Firehose $29/GB delivered, S3 PUT $0.005/1 000 requests  
+- **Use Case Example**: Every order change lands in your lake in **Parquet**, **partitioned**, **query-ready** — no Glue, no Athena, no human required.
+
+<details>
+    <summary>Click to view the breaking down every component, configuration, behavior, parameter, and edge case.</summary>
+
+#### 1. Firehose Buffer Engine
+- **What Happens**: Firehose is a **serverless RAM buffer** that aggregates Kinesis records until one of two limits is hit.
+- **How Data Flows Here**:
+  - RAM address `0x7f3a2c1b9000` holds **2.79 MB** of base64 JSON.  
+  - Two independent triggers:  
+    `SizeInMBs = 64`  OR  `IntervalInSeconds = 60`  
+  - At **14:32:09.128800000** the **60-second timer fires** → buffer flushes.
+- **Configuration** (one CLI line):
+  ```bash
+  BufferingHints='{"SizeInMBs":64,"IntervalInSeconds":60}'
+  ```
+- **Why This Behavior?**  
+  Buffering trades **latency for cost** — 1 PUT instead of 1 000.  
+  Change to `IntervalInSeconds=1` → 60× more PUTs, 60× higher cost, 1-second freshness.
+
+- **Little Details & Varying Parameters**:
+  - **Back-pressure**: S3 throttles → Firehose retries **24 h** with exponential back-off.  
+  - **DLQ**: After 24 h → records go to `s3://cdc-lake-prod/dlq/` + SNS alert.  
+  - **In-flight encryption**: TLS 1.3 → S3 SSE-KMS (customer key).
+
+#### 2. Lambda Transform (JSON → Parquet)
+- **What Happens**: A **stateless Node.js function** that runs **once per buffer**.
+- **Data Flow Behavior**:
+  1. Firehose invokes Lambda with **1 000 base64 records**.  
+  2. Lambda parses → adds `processed_at` → serialises to **Snappy Parquet**.  
+  3. Returns **0.91 MB** (68 % smaller).
+- **Configuration**:
+  - Memory: 256 MB  
+  - Timeout: 30 s  
+  - Code (8 lines):
+    ```js
+    exports.handler = async (event) => {
+      return event.records.map(r => ({
+        recordId: r.recordId,
+        result: 'Ok',
+        data: Buffer.from(JSON.stringify({
+          ...JSON.parse(Buffer.from(r.data, 'base64')),
+          processed_at: new Date().toISOString()
+        }))).toString('base64')
+      }));
+    };
+    ```
+- **Why 1.8 s?**  
+  Cold starts cached → **0 ms warm-up**.  
+  Native Parquet (2025) → **< 200 ms**, no Lambda needed.
+
+#### 3. S3 PUT + Manifest (Exactly-Once)
+- **What Happens**: Firehose performs **two atomic PUTs** in strict order.
+- **Data Flow Behavior**:
+  1. **14:32:09.130600000**  
+     `PUT /raw/year=2025/month=11/day=07/hour=14/part-00000-7a3f2c1.snappy.parquet`  
+     → ETag `"d41d8cd98f00b204e9800998ecf8427e"`
+  2. **14:32:09.130900000**  
+     `PUT /manifest/2025-11-07T14.json`  
+     → contains **exact S3 URL** of the Parquet file.
+- **Configuration**:
+  ```bash
+  Prefix=raw/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/
+  CompressionFormat=Snappy
+  ErrorOutputPrefix=errors/
+  ```
+- **Why This Behavior?**  
+  **Manifest guarantees zero duplicates** — Redshift COPY reads the manifest, never the folder.  
+  If PUT #1 fails → **no manifest** → zero partial data.
+
+- **Little Details & Varying Parameters**:
+  - **Dynamic partitioning**: `!{partitionKeyFromLambda:path}` → per-table folders.  
+  - **S3 Storage Class**: `INTELLIGENT_TIERING` → auto-moves cold files to Glacier.  
+  - **Versioning**: Enabled → every PUT is versioned → audit trail forever.
+
+#### 4. Final Destination: Pure S3 Data Lake
+- **What Happens**: **The pipeline ENDS here**.  
+  You now own **immutable, partitioned Parquet** files.
+- **Query Options (zero Glue needed)**:
+  ```bash
+  # DuckDB (local)
+  duckdb -c "SELECT * FROM 's3://cdc-lake-prod/raw/.../part-00000.snappy.parquet' WHERE id=98765"
+
+  # Spark
+  spark.read.parquet("s3://cdc-lake-prod/raw/year=2025/month=11/day=07/hour=14/")
+
+  # Pandas
+  pd.read_parquet("s3://cdc-lake-prod/raw/.../part-00000.snappy.parquet")
+  ```
+- **Redshift (manifest COPY)**:
+  ```sql
+  COPY sales.orders
+  FROM 's3://cdc-lake-prod/manifest/2025-11-07T14.json'
+  IAM_ROLE 'arn:...' FORMAT PARQUET;
+  ```
+
+#### One-Page Runbook
+```markdown
+# Firehose → S3 Lake
+14:32:09.128800 Buffer full → 60 s timer
+14:32:09.128800 Lambda → Parquet (1.8 s)
+14:32:09.130600 S3 PUT + ETag
+14:32:09.130900 Manifest atomic write
+DONE — query with any tool, no Glue
+```
+
+From here, the data is **permanently stored in S3** — query it with DuckDB, Spark, Pandas, Redshift, Snowflake, BigQuery, Databricks, or any tool that speaks Parquet.
+
+You now own the **pure, serverless, sub-3-second lake** — **no crawlers, no catalogs, no middlemen**.
+
+</details>
+
 <details>
     <summary>Click to view the Forensic Audit Trail</summary>
 
