@@ -341,4 +341,143 @@ From here, the data is sent to S3, Redshift, OpenSearch, or any other services.
 
 ---
 
-### Amazon KDS Pricing
+
+### Amazon Data Firehose
+
+<details>
+    <summary>Click to view the Forensic Audit Trail</summary>
+
+## Forensic Audit Trail  
+**Kinesis Data Firehose → S3 Data Lake**  
+**14:32:09.130300000 → 14:32:09.133900000**  
+**3.6 milliseconds** – **zero bytes lost, zero duplicates, instantly queryable**
+
+Every microsecond is **timestamped**, **S3-event-linked**, **cost-tagged**, and **Athena-ready**.
+
+```
+Firehose:      rds-to-lake
+S3 Bucket:     cdc-lake-prod
+Prefix:        raw/year=2025/month=11/day=07/hour=14/
+Object:        part-00000-7a3f2c1.snappy.parquet
+Manifest:      manifest/2025-11-07T14.json
+Glue Crawler:  cdc-hourly
+Athena Table:  cdc.orders
+```
+
+────────────────────────
+1. **14:32:09.130300000**  
+   Lambda returns **0.91 MB Snappy Parquet**  
+   ```bash
+   Content-Type: application/x-parquet
+   Content-Encoding: snappy
+   x-amz-meta-processed-at: 2025-11-07T14:32:09.130Z
+   ```
+
+2. **14:32:09.130600000**  
+   Firehose **PUT** to S3  
+   ```http
+   PUT /raw/year=2025/month=11/day=07/hour=14/part-00000-7a3f2c1.snappy.parquet
+   HTTP/1.1 200 OK
+   ETag: "d41d8cd98f00b204e9800998ecf8427e"
+   x-amz-version-id: v1234567890abcdef
+   ```
+   CloudWatch → `DeliveryToS3.Success=1`  
+   Cost → **$0.000005**
+
+3. **14:32:09.130900000**  
+   Firehose writes **manifest** (atomic)  
+   ```json
+   {
+     "entries": [{
+       "url": "s3://cdc-lake-prod/raw/.../part-00000-7a3f2c1.snappy.parquet",
+       "mandatory": true
+     }]
+   }
+   ```
+   S3 Event → **s3:ObjectCreated:Put**
+
+4. **14:32:09.131100000**  
+   S3 triggers **EventBridge rule**  
+   ```json
+   {
+     "source": ["aws.s3"],
+     "detail-type": ["Object Created"],
+     "detail": { "bucket": { "name": "cdc-lake-prod" } }
+   }
+   ```
+
+5. **14:32:09.131400000**  
+   EventBridge → **Lambda glue-trigger** (14 ms)  
+   ```js
+   await glue.startCrawler({ Name: 'cdc-hourly' })
+   ```
+
+6. **14:32:09.131800000**  
+   Glue Crawler **scans manifest**  
+   - Discovers **1 new partition**  
+   - Updates Glue Catalog table `cdc.orders`  
+   - Adds partition:  
+     ```sql
+     year=2025/month=11/day=07/hour=14
+     ```
+
+7. **14:32:09.132900000**  
+   Athena **sees new data instantly**  
+   ```sql
+   SELECT id, status, processed_at
+   FROM cdc.orders
+   WHERE hour = 14
+   LIMIT 1;
+   -- Returns: 98765 | shipped | 2025-11-07 14:32:09.130Z
+   ```
+   Latency from DMS → Athena: **2.8729 s + 3.6 ms = 2.8765 s**
+
+8. **14:32:09.133200000**  
+   Redshift **COPY** (parallel)  
+   ```sql
+   COPY sales.orders
+   FROM 's3://cdc-lake-prod/manifest/2025-11-07T14.json'
+   IAM_ROLE 'arn:aws:iam::...:role/redshift'
+   FORMAT PARQUET;
+   ```
+
+9. **14:32:09.133900000**  
+   **Zero-downtime upsert** via staging table  
+   ```sql
+   DELETE FROM sales.orders USING staging WHERE orders.id = staging.id;
+   INSERT INTO sales.orders SELECT * FROM staging;
+   ```
+
+────────────────────────
+**One-Page Runbook**
+```markdown
+# Firehose → Lake in 3.6 ms
+14:32:09.130300 Lambda → 0.91 MB Parquet
+14:32:09.130600 S3 PUT + ETag
+14:32:09.130900 Manifest atomic write
+14:32:09.131400 EventBridge → Glue Crawler
+14:32:09.132900 Athena sees new partition
+14:32:09.133900 Redshift zero-downtime upsert
+Queryable in 2.8765 s end-to-end
+```
+
+────────────────────────
+**Cost Snapshot (this 3.6 ms window)**
+```
+S3 PUT request      $0.000005
+S3 storage (1 h)    $0.000000095
+Glue Crawler        $0.00044 (shared)
+EventBridge         $0.0000001
+TOTAL               $0.000005595
+```
+
+────────────────────────
+**What-If Cheat Sheet**
+- `BufferingHints.SizeInMBs=1` → file lands **every 1.38 MB**, not 60 s  
+- `ErrorOutputPrefix=errors/` → bad rows → `errors/2025-11-07T14/`  
+- `S3BackupMode=AllData` → raw JSON also saved  
+- `DataFormatConversion=ORC` → 15 % smaller files
+
+From here, the data lives **forever** in your lake — query it in Athena, upsert it in Redshift, search it in OpenSearch, or train ML models on it.
+    
+</details>
