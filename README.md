@@ -18,3 +18,6 @@ Amazon Kinesis is a platform of services provided by Amazon Web Services (AWS) f
   - This service allows for processing and analyzing streaming data using standard SQL or with Java (managed Apache Flink). It enables the creation of applications that continuously read and process streaming data, perform time-series analytics, feed real-time dashboards, and generate real-time metrics. 
 
 </details>
+
+## Amazon Kinesis Data Streams
+### Amazon KDS Pricing
